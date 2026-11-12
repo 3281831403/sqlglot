@@ -432,9 +432,16 @@ def _mergeable(
         or not isinstance(inner_select, exp.Select)
         or any(v for k, v in inner_select.args.items() if k in UNMERGABLE_ARGS)
         or inner_select.args.get("from_") is None
+        # Merging through a parenthesized operand can move filters or joins outside its group.
+        or (
+            source is not from_or_join.this
+            and (inner_select.args.get("where") or inner_select.args.get("joins"))
+        )
         or outer_scope.pivots
         or any(j.args.get("nearest") for j in outer_args.get("joins", []))
-        or any(j.args.get("nearest") for j in inner_select.args.get("joins", []))
+        or any(
+            j.args.get("nearest") or not j.alias_or_name for j in inner_select.args.get("joins", [])
+        )
         or (leave_tables_isolated and len(outer_scope.selected_sources) > 1)
         or (isinstance(from_or_join, exp.Join) and inner_select.args.get("joins"))
         or (
