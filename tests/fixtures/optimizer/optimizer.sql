@@ -1753,14 +1753,14 @@ SELECT
   "z"."c" AS "c",
   "v"."a" AS "a"
 FROM "x" AS "x"
-JOIN (
+CROSS JOIN (
   "y" AS "y"
     RIGHT JOIN "y" AS "z"
       ON "y"."b" = "z"."b"
 )
-  ON "y"."b" > 0
-JOIN "x" AS "v"
-  ON "v"."a" = "x"."a"
+CROSS JOIN "x" AS "v"
+WHERE
+  "v"."a" = "x"."a" AND "y"."b" > 0
 ORDER BY
   "x"."a",
   "y"."b",
@@ -1776,14 +1776,14 @@ SELECT
   "z"."c" AS "c",
   "v"."a" AS "a"
 FROM "x" AS "x"
-JOIN (
+CROSS JOIN (
   "y" AS "y"
     FULL JOIN "y" AS "z"
       ON "y"."b" = "z"."b"
 )
-  ON "y"."b" > 0
-JOIN "x" AS "v"
-  ON "v"."a" = "x"."a"
+CROSS JOIN "x" AS "v"
+WHERE
+  "v"."a" = "x"."a" AND "y"."b" > 0
 ORDER BY
   "x"."a",
   "y"."b",
@@ -1805,16 +1805,15 @@ SELECT
   "y"."b" AS "b",
   "z"."c" AS "c"
 FROM "x" AS "x"
-JOIN (
+CROSS JOIN (
   "y" AS "y"
     RIGHT JOIN "y" AS "z"
       ON "y"."b" = "z"."b"
 )
-  ON "y"."b" > 0
 LEFT JOIN "_u_0" AS "_u_0"
   ON "_u_0"."a" = "x"."a"
 WHERE
-  NOT "_u_0"."a" IS NULL
+  "y"."b" > 0 AND NOT "_u_0"."a" IS NULL
 ORDER BY
   "x"."a",
   "y"."b",
@@ -1835,16 +1834,15 @@ SELECT
   "y"."b" AS "b",
   "z"."c" AS "c"
 FROM "x" AS "x"
-JOIN (
+CROSS JOIN (
   "y" AS "y"
     FULL JOIN "y" AS "z"
       ON "y"."b" = "z"."b"
 )
-  ON "y"."b" > 0
 LEFT JOIN "_u_0" AS "_u_0"
   ON "_u_0"."_u_1" = "x"."a"
 WHERE
-  NOT "_u_0"."_u_1" IS NULL
+  "y"."b" > 0 AND NOT "_u_0"."_u_1" IS NULL
 ORDER BY
   "x"."a",
   "y"."b",
@@ -1889,16 +1887,17 @@ SELECT
   "z"."c" AS "c",
   "l"."a" AS "a"
 FROM "x" AS "x"
-JOIN (
+CROSS JOIN (
   "y" AS "y"
     RIGHT JOIN "y" AS "z"
       ON "y"."b" = "z"."b"
 )
-  ON "y"."b" > 0
 CROSS JOIN LATERAL (
   SELECT
     "x"."a" + 1 AS "a"
 ) AS "l"
+WHERE
+  "y"."b" > 0
 ORDER BY
   "x"."a",
   "y"."b",
