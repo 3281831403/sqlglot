@@ -147,3 +147,23 @@ SELECT x.a, z.b FROM x JOIN (SELECT b FROM z) AS z ON x.b = z.b FULL JOIN y ON x
 -- A later RIGHT JOIN null-extends the source of an earlier one
 SELECT x.a, z.b FROM x RIGHT JOIN z ON x.b = z.b RIGHT JOIN y ON x.b = y.b WHERE z.b = 3;
 SELECT x.a, z.b FROM x RIGHT JOIN z ON x.b = z.b RIGHT JOIN y ON x.b = y.b WHERE z.b = 3;
+
+# title: Keep predicates referencing an earlier comma group in WHERE
+# execute: true
+SELECT x.a, y.b, z.c, v.a FROM x, y RIGHT JOIN y AS z ON y.b = z.b, x AS v WHERE v.a = x.a AND y.b > 0 ORDER BY x.a, y.b, z.c, v.a;
+SELECT x.a, y.b, z.c, v.a FROM x, y RIGHT JOIN y AS z ON y.b = z.b, x AS v WHERE v.a = x.a AND y.b > 0 ORDER BY x.a, y.b, z.c, v.a;
+
+# title: Keep DNF predicates referencing an earlier comma group in WHERE
+# execute: true
+SELECT x.a, y.b, z.c, v.a FROM x, y FULL JOIN y AS z ON y.b = z.b, x AS v WHERE (v.a = x.a AND v.a > 0) OR (v.a > x.a AND v.a < 5) ORDER BY x.a, y.b, z.c, v.a;
+SELECT x.a, y.b, z.c, v.a FROM x, y FULL JOIN y AS z ON y.b = z.b, x AS v WHERE (v.a < 5 AND v.a > x.a) OR (v.a = x.a AND v.a > 0) ORDER BY x.a, y.b, z.c, v.a;
+
+# title: Push predicates within the same preserved comma group
+# execute: true
+SELECT x.a, y.b, z.c, v.a FROM x, y RIGHT JOIN y AS z ON y.b = z.b, x AS v WHERE v.a = y.b AND y.b > 0 ORDER BY x.a, y.b, z.c, v.a;
+SELECT x.a, y.b, z.c, v.a FROM x, y RIGHT JOIN y AS z ON y.b = z.b JOIN x AS v ON v.a = y.b WHERE TRUE AND y.b > 0 ORDER BY x.a, y.b, z.c, v.a;
+
+# title: Push DNF predicates within the same preserved comma group
+# execute: true
+SELECT x.a, y.b, z.c, v.a FROM x, y FULL JOIN y AS z ON y.b = z.b, x AS v WHERE (v.a = y.b AND v.a > 0) OR (v.a > y.b AND v.a < 5) ORDER BY x.a, y.b, z.c, v.a;
+SELECT x.a, y.b, z.c, v.a FROM x, y FULL JOIN y AS z ON y.b = z.b JOIN x AS v ON (v.a < 5 AND v.a > y.b) OR (v.a = y.b AND v.a > 0) WHERE (v.a < 5 AND v.a > y.b) OR (v.a = y.b AND v.a > 0) ORDER BY x.a, y.b, z.c, v.a;
