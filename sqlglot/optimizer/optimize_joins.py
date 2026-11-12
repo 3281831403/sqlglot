@@ -99,7 +99,12 @@ def normalize(expression: E) -> E:
     Remove INNER and OUTER from joins as they are optional.
     """
     for join in expression.find_all(exp.Join):
-        if join.kind == "PASTE" or join.method == "POSITIONAL" or join.args.get("nearest"):
+        if (
+            join.kind == "PASTE"
+            or join.method == "POSITIONAL"
+            or join.args.get("nearest")
+            or join.this.args.get("cross_apply") is not None
+        ):
             continue
 
         if not any(join.args.get(k) for k in JOIN_ATTRS):
@@ -127,7 +132,10 @@ def normalize_join_groups(expression: E) -> E:
     outer = False
     for i in range(len(joins) - 1, -1, -1):
         join = joins[i]
-        if not any(join.args.get(k) for k in JOIN_ATTRS):
+        if (
+            not any(join.args.get(k) for k in JOIN_ATTRS)
+            and join.this.args.get("cross_apply") is None
+        ):
             if outer:
                 # JOIN binds more tightly than comma, so its left operand excludes preceding groups.
                 operand = join.this
@@ -175,6 +183,7 @@ def _is_reorderable(joins: Iterable[exp.Join]) -> bool:
         or join.kind == "PASTE"
         or join.method == "POSITIONAL"
         or join.args.get("nearest")
+        or join.this.args.get("cross_apply") is not None
         or not join.alias_or_name
         for join in joins
     )
