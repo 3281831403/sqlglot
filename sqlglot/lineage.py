@@ -78,6 +78,39 @@ class Node:
         return GraphHTML(nodes, edges, **opts)
 
 
+def _write_columns(expression: exp.Expr, schema: Schema, dialect: DialectType) -> list[str] | None:
+    """
+    Resolve the columns written by an INSERT or a CREATE TABLE ... AS SELECT, in write order.
+
+    An explicit column list wins. Otherwise the target table's schema column order is used.
+    Returns None when the statement has no write target or its columns can't be determined
+    (e.g. the target table is absent from the schema), in which case lineage falls back to
+    the projection names.
+    """
+    is_insert = isinstance(expression, exp.Insert)
+    is_ctas = isinstance(expression, exp.Create) and isinstance(expression.expression, exp.Query)
+    if not (is_insert or is_ctas):
+        return None
+
+    target = expression.this
+
+    table = target.this if isinstance(target, exp.Schema) else target
+    if not isinstance(table, exp.Table):
+        return None
+
+    if isinstance(target, exp.Schema) and target.expressions:
+        return [
+            normalize_identifiers.normalize_identifiers(col, dialect=dialect).name
+            for col in target.expressions
+        ]
+
+    columns = [
+        normalize_identifiers.normalize_identifiers(exp.to_identifier(name), dialect=dialect).name
+        for name in schema.column_names(table, dialect=dialect)
+    ]
+    return columns or None
+
+
 @t.overload
 def lineage(
     column: str | exp.Column, sql: str | exp.Expr, schema: dict | Schema, **kwargs: t.Any
@@ -159,40 +192,59 @@ def lineage(
     cache: dict[tuple, Node] = {}
     scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
 
+    # An INSERT / CREATE TABLE ... AS SELECT writes into target columns positionally: the i-th
+    # projection feeds the i-th write column, regardless of the projection's alias. A plain
+    # SELECT has no write target, so it keeps resolving columns by projection name.
+    write_columns = _write_columns(expression, schema, dialect)
+
+    def build(write_column: str, index: int) -> Node:
+        return to_node(
+            index if write_columns is not None else write_column,
+            scope,
+            dialect,
+            trim_selects=trim_selects,
+            schema=schema,
+            _cache=cache,
+            _scope_meta=scope_meta,
+            on_node=on_node,
+            _root_name=write_column if write_columns is not None else None,
+        )
+
+    if write_columns is not None:
+        projections = selectable.selects
+        if len(write_columns) != len(projections):
+            raise SqlglotError(
+                f"Cannot build lineage: write target defines {len(write_columns)} column(s) "
+                f"but the query projects {len(projections)}: {selectable.sql(dialect=dialect)}"
+            )
+
     if column is not None:
         column_name = normalize_identifiers.normalize_identifiers(column, dialect=dialect).name
+
+        if write_columns is not None:
+            try:
+                index = write_columns.index(column_name)
+            except ValueError:
+                raise SqlglotError(f"Cannot find column '{column_name}' in query.") from None
+            return build(column_name, index)
+
         if not any(select.alias_or_name == column_name for select in selectable.selects):
             raise SqlglotError(f"Cannot find column '{column_name}' in query.")
 
-        return to_node(
-            column_name,
-            scope,
-            dialect,
-            trim_selects=trim_selects,
-            schema=schema,
-            _cache=cache,
-            _scope_meta=scope_meta,
-            on_node=on_node,
-        )
+        return build(column_name, 0)
 
     result: dict[str, Node] = {}
-    for sel in selectable.selects:
-        name = sel.alias_or_name
-        if not name:
-            raise SqlglotError(
-                f"Cannot fetch lineage for unnamed projection: {sel.sql(dialect=dialect)}."
-            )
-
-        result[name] = to_node(
-            name,
-            scope,
-            dialect,
-            trim_selects=trim_selects,
-            schema=schema,
-            _cache=cache,
-            _scope_meta=scope_meta,
-            on_node=on_node,
-        )
+    if write_columns is not None:
+        for index, name in enumerate(write_columns):
+            result[name] = build(name, index)
+    else:
+        for sel in selectable.selects:
+            name = sel.alias_or_name
+            if not name:
+                raise SqlglotError(
+                    f"Cannot fetch lineage for unnamed projection: {sel.sql(dialect=dialect)}."
+                )
+            result[name] = build(name, 0)
 
     return result
 
@@ -210,8 +262,13 @@ def to_node(
     _cache: dict[tuple, Node] | None = None,
     _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
     on_node: t.Callable[[Node], None] | None = None,
+    _root_name: str | None = None,
 ) -> Node:
-    cache_key = (column, id(scope), scope_name, source_name, reference_node_name)
+    # A write statement (INSERT / CTAS) resolves its root positionally by index but labels the
+    # root node with the target column's name. The override applies only to the root call, since
+    # every recursive call below passes an upstream and leaves _root_name unset.
+    node_name = _root_name if _root_name is not None and upstream is None else None
+    cache_key = (column, id(scope), scope_name, source_name, reference_node_name, node_name)
 
     if _cache is not None and cache_key in _cache:
         cached_node = _cache[cache_key]
@@ -262,6 +319,7 @@ def to_node(
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
+                _root_name=node_name,
             )
             # Skip caching a passed-in upstream returned by an inner SetOp:
             # a sibling call at the same key with that node as its upstream
@@ -272,7 +330,9 @@ def to_node(
     if isinstance(scope.expression, exp.SetOperation):
         name = type(scope.expression).__name__.upper()
         created_setop = upstream is None
-        upstream = upstream or Node(name=name, source=scope.expression, expression=select)
+        upstream = upstream or Node(
+            name=node_name or name, source=scope.expression, expression=select
+        )
 
         index = (
             column
@@ -322,7 +382,7 @@ def to_node(
 
     # Create the node for this step in the lineage chain, and attach it to the previous one.
     node = Node(
-        name=f"{scope_name}.{column}" if scope_name else str(column),
+        name=node_name or (f"{scope_name}.{column}" if scope_name else str(column)),
         source=source,
         expression=select,
         source_name=source_name or "",

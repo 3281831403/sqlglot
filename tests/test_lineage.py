@@ -1379,3 +1379,133 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def test_insert_lineage_aligns_columns_positionally(self) -> None:
+        # The write list order, not the projection aliases, determines which projection
+        # feeds each target column: buyer_id <- o.order_id and order_id <- u.uid.
+        sql = """
+        INSERT INTO dw.orders (buyer_id, order_id)
+        SELECT o.order_id, u.uid
+        FROM src.orders AS o
+        JOIN src.users AS u ON o.uid = u.uid
+        """
+        schema = {
+            "dw": {"orders": {"buyer_id": "BIGINT", "order_id": "BIGINT"}},
+            "src": {
+                "orders": {"order_id": "BIGINT", "uid": "BIGINT"},
+                "users": {"uid": "BIGINT"},
+            },
+        }
+
+        node = lineage("buyer_id", sql, schema=schema)
+        self.assertEqual(node.name, "buyer_id")
+        self.assertEqual(node.expression.sql(), "o.order_id AS order_id")
+        self.assertEqual(len(node.downstream), 1)
+        self.assertEqual(node.downstream[0].name, "o.order_id")
+
+        node = lineage("order_id", sql, schema=schema)
+        self.assertEqual(node.name, "order_id")
+        self.assertEqual(node.expression.sql(), "u.uid AS uid")
+        self.assertEqual(node.downstream[0].name, "u.uid")
+
+        result = lineage(None, sql, schema=schema)
+        self.assertEqual(list(result), ["buyer_id", "order_id"])
+        self.assertEqual(
+            [node.expression.sql() for node in result.values()],
+            ["o.order_id AS order_id", "u.uid AS uid"],
+        )
+
+    def test_insert_lineage_unknown_column_raises(self) -> None:
+        sql = "INSERT INTO dw.orders (buyer_id) SELECT order_id FROM src.orders"
+        schema = {
+            "dw": {"orders": {"buyer_id": "BIGINT", "order_id": "BIGINT"}},
+            "src": {"orders": {"order_id": "BIGINT"}},
+        }
+
+        with self.assertRaises(sqlglot.errors.SqlglotError):
+            lineage("order_id", sql, schema=schema)
+
+    def test_insert_lineage_column_count_mismatch_raises(self) -> None:
+        schema = {
+            "dw": {"orders": {"buyer_id": "BIGINT", "order_id": "BIGINT"}},
+            "src": {"orders": {"order_id": "BIGINT", "uid": "BIGINT"}},
+        }
+
+        with self.assertRaises(sqlglot.errors.SqlglotError):
+            lineage(
+                None,
+                "INSERT INTO dw.orders (buyer_id) SELECT order_id, uid FROM src.orders",
+                schema=schema,
+            )
+
+    def test_insert_lineage_without_list_uses_target_schema_order(self) -> None:
+        sql = "INSERT INTO dw.orders SELECT order_id, uid FROM src.orders"
+        schema = {
+            "dw": {"orders": {"buyer_id": "BIGINT", "order_id": "BIGINT"}},
+            "src": {"orders": {"order_id": "BIGINT", "uid": "BIGINT"}},
+        }
+
+        result = lineage(None, sql, schema=schema)
+        self.assertEqual(list(result), ["buyer_id", "order_id"])
+        self.assertEqual(result["buyer_id"].expression.sql(), "orders.order_id AS order_id")
+        self.assertEqual(result["order_id"].expression.sql(), "orders.uid AS uid")
+
+    def test_insert_lineage_without_schema_falls_back_to_projection_names(self) -> None:
+        # The target table is unknown to the schema and no write list is given, so lineage
+        # keeps resolving by projection name instead of failing.
+        sql = "INSERT INTO dw.unknown SELECT order_id, uid FROM src.orders"
+        schema = {"src": {"orders": {"order_id": "BIGINT", "uid": "BIGINT"}}}
+
+        result = lineage(None, sql, schema=schema)
+        self.assertEqual(list(result), ["order_id", "uid"])
+        self.assertEqual(result["order_id"].downstream[0].name, "orders.order_id")
+
+    def test_ctas_lineage_aligns_columns_positionally(self) -> None:
+        schema = {
+            "dw": {"orders": {"buyer_id": "BIGINT", "order_id": "BIGINT"}},
+            "src": {"orders": {"order_id": "BIGINT", "uid": "BIGINT"}},
+        }
+
+        # Explicit column list (with types) wins and aligns positionally.
+        result = lineage(
+            None,
+            "CREATE TABLE dw.orders (buyer_id BIGINT, order_id BIGINT) AS "
+            "SELECT order_id, uid FROM src.orders",
+            schema=schema,
+        )
+        self.assertEqual(list(result), ["buyer_id", "order_id"])
+        self.assertEqual(result["buyer_id"].expression.sql(), "orders.order_id AS order_id")
+        self.assertEqual(result["order_id"].expression.sql(), "orders.uid AS uid")
+
+        # Without a list, the target table's schema column order is used.
+        result = lineage(
+            None,
+            "CREATE TABLE dw.orders AS SELECT order_id, uid FROM src.orders",
+            schema=schema,
+        )
+        self.assertEqual(list(result), ["buyer_id", "order_id"])
+        self.assertEqual(result["buyer_id"].expression.sql(), "orders.order_id AS order_id")
+
+    def test_insert_lineage_set_operation_aligns_positionally(self) -> None:
+        sql = """
+        INSERT INTO dw.orders (buyer_id, order_id)
+        SELECT order_id, uid FROM src.t1
+        UNION ALL
+        SELECT order_id, uid FROM src.t2
+        """
+        schema = {
+            "dw": {"orders": {"buyer_id": "BIGINT", "order_id": "BIGINT"}},
+            "src": {
+                "t1": {"order_id": "BIGINT", "uid": "BIGINT"},
+                "t2": {"order_id": "BIGINT", "uid": "BIGINT"},
+            },
+        }
+
+        node = lineage("buyer_id", sql, schema=schema)
+        self.assertEqual(node.name, "buyer_id")
+        # One branch per UNION arm, each tracing the first projection positionally.
+        self.assertEqual(len(node.downstream), 2)
+        self.assertEqual(
+            sorted(leaf.name for leaf in node.walk() if not leaf.downstream),
+            ["t1.order_id", "t2.order_id"],
+        )
