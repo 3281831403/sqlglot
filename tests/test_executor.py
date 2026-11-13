@@ -510,6 +510,232 @@ class TestExecutor(unittest.TestCase):
         sql = "SELECT DISTINCT a FROM x GROUP BY a ORDER BY AVG(b)"
         self.assertEqual(execute(sql, tables=tables).rows, [(2,), (1,), (3,)])
 
+    def test_rollup(self):
+        tables = {
+            "x": [
+                {"a": 1, "b": "x", "c": 10},
+                {"a": 1, "b": "y", "c": 20},
+                {"a": 2, "b": "x", "c": 30},
+            ]
+        }
+        result = execute(
+            "SELECT a, b, SUM(c) AS s FROM x GROUP BY ROLLUP(a, b) ORDER BY a, b",
+            tables=tables,
+        )
+        self.assertEqual(result.columns, ("a", "b", "s"))
+        self.assertEqual(
+            result.rows,
+            [
+                (None, None, 60),
+                (1, None, 30),
+                (1, "x", 10),
+                (1, "y", 20),
+                (2, None, 30),
+                (2, "x", 30),
+            ],
+        )
+
+        # ROLLUP composed with a plain GROUP BY expression
+        result = execute(
+            "SELECT a, b, SUM(c) AS s FROM x GROUP BY a, ROLLUP(b) ORDER BY a, b",
+            tables=tables,
+        )
+        self.assertEqual(
+            result.rows,
+            [
+                (1, None, 30),
+                (1, "x", 10),
+                (1, "y", 20),
+                (2, None, 30),
+                (2, "x", 30),
+            ],
+        )
+
+    def test_cube(self):
+        tables = {
+            "x": [
+                {"a": 1, "b": "x", "c": 10},
+                {"a": 1, "b": "y", "c": 20},
+                {"a": 2, "b": "x", "c": 30},
+            ]
+        }
+        result = execute(
+            "SELECT a, b, SUM(c) AS s FROM x GROUP BY CUBE(a, b) ORDER BY a, b",
+            tables=tables,
+        )
+        self.assertEqual(result.columns, ("a", "b", "s"))
+        self.assertEqual(
+            result.rows,
+            [
+                (None, None, 60),
+                (None, "x", 40),
+                (None, "y", 20),
+                (1, None, 30),
+                (1, "x", 10),
+                (1, "y", 20),
+                (2, None, 30),
+                (2, "x", 30),
+            ],
+        )
+
+    def test_grouping_sets(self):
+        tables = {
+            "x": [
+                {"a": 1, "b": "x", "c": 10},
+                {"a": 1, "b": "y", "c": 20},
+                {"a": 2, "b": "x", "c": 30},
+            ]
+        }
+        result = execute(
+            "SELECT a, b, SUM(c) AS s FROM x GROUP BY GROUPING SETS ((a), (a, b), ()) ORDER BY a, b",
+            tables=tables,
+        )
+        self.assertEqual(result.columns, ("a", "b", "s"))
+        self.assertEqual(
+            result.rows,
+            [
+                (None, None, 60),
+                (1, None, 30),
+                (1, "x", 10),
+                (1, "y", 20),
+                (2, None, 30),
+                (2, "x", 30),
+            ],
+        )
+
+        # ROLLUP nested inside GROUPING SETS
+        result = execute(
+            "SELECT a, b, SUM(c) AS s FROM x GROUP BY GROUPING SETS (ROLLUP(a), (b)) ORDER BY a, b",
+            tables=tables,
+        )
+        self.assertEqual(
+            result.rows,
+            [
+                (None, None, 60),
+                (None, "x", 40),
+                (None, "y", 20),
+                (1, None, 30),
+                (2, None, 30),
+            ],
+        )
+
+        # the empty grouping set aggregates an empty input into a single row
+        result = execute(
+            "SELECT a, COUNT(c) AS n FROM x GROUP BY GROUPING SETS ((a), ())",
+            schema={"x": {"a": "INT", "b": "TEXT", "c": "INT"}},
+            tables={"x": []},
+        )
+        self.assertEqual(result.rows, [(None, 0)])
+
+    def test_grouping_funcs(self):
+        tables = {
+            "x": [
+                {"a": 1, "b": "x", "c": 10},
+                {"a": 1, "b": "y", "c": 20},
+                {"a": 2, "b": "x", "c": 30},
+            ]
+        }
+        result = execute(
+            """
+            SELECT a, b, GROUPING(a) AS ga, GROUPING(b) AS gb, GROUPING_ID(a, b) AS gid, SUM(c) AS s
+            FROM x
+            GROUP BY ROLLUP(a, b)
+            ORDER BY a, b
+            """,
+            tables=tables,
+        )
+        self.assertEqual(result.columns, ("a", "b", "ga", "gb", "gid", "s"))
+        self.assertEqual(
+            result.rows,
+            [
+                (None, None, 1, 1, 3, 60),
+                (1, None, 0, 1, 1, 30),
+                (1, "x", 0, 0, 0, 10),
+                (1, "y", 0, 0, 0, 20),
+                (2, None, 0, 1, 1, 30),
+                (2, "x", 0, 0, 0, 30),
+            ],
+        )
+
+        # GROUPING in HAVING keeps only the super-aggregate rows
+        result = execute(
+            "SELECT a, b, SUM(c) AS s FROM x GROUP BY ROLLUP(a, b) HAVING GROUPING(b) = 1 ORDER BY a",
+            tables=tables,
+        )
+        self.assertEqual(
+            result.rows,
+            [
+                (None, None, 60),
+                (1, None, 30),
+                (2, None, 30),
+            ],
+        )
+
+        # GROUPING over a non-column expression
+        result = execute(
+            "SELECT a + 1 AS a1, GROUPING(a + 1) AS g, SUM(c) AS s FROM x GROUP BY ROLLUP(a + 1) ORDER BY a1",
+            tables=tables,
+        )
+        self.assertEqual(
+            result.rows,
+            [
+                (None, 1, 60),
+                (2, 0, 30),
+                (3, 0, 30),
+            ],
+        )
+
+    def test_rollup_with_rollup_mysql(self):
+        tables = {
+            "x": [
+                {"a": 1, "b": "x", "c": 10},
+                {"a": 1, "b": "y", "c": 20},
+                {"a": 2, "b": "x", "c": 30},
+            ]
+        }
+        result = execute(
+            "SELECT a, SUM(c) AS s FROM x GROUP BY a WITH ROLLUP",
+            dialect="mysql",
+            tables=tables,
+        )
+        self.assertEqual(result.columns, ("a", "s"))
+        self.assertEqual(
+            result.rows,
+            [
+                (1, 30),
+                (2, 30),
+                (None, 60),
+            ],
+        )
+
+    def test_rollup_having_order_by_limit(self):
+        tables = {
+            "x": [
+                {"a": 1, "b": "x", "c": 10},
+                {"a": 1, "b": "y", "c": 20},
+                {"a": 2, "b": "x", "c": 30},
+            ]
+        }
+        # HAVING, ORDER BY and LIMIT/OFFSET apply to the merged grouping sets
+        result = execute(
+            """
+            SELECT a, b, SUM(c) AS s
+            FROM x
+            GROUP BY ROLLUP(a, b)
+            HAVING SUM(c) > 15
+            ORDER BY a, b
+            LIMIT 2 OFFSET 1
+            """,
+            tables=tables,
+        )
+        self.assertEqual(
+            result.rows,
+            [
+                (1, None, 30),
+                (1, "y", 20),
+            ],
+        )
+
     def test_distinct_order_by_column_from_different_table(self):
         schema = {"x": {"a": "int", "id": "int"}, "y": {"a": "int", "id": "int"}}
         tables = {

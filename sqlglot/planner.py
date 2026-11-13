@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 import typing as t
 
@@ -186,9 +187,23 @@ class Step:
             set_ops_and_aggs(aggregate)
 
             # give aggregates names and replace projections with references to them
-            aggregate.group = {
-                f"_g{i}": e for i, e in enumerate(group.expressions if group else [])
-            }
+            grouping_sets = _expand_grouping_sets(group) if group else None
+
+            if grouping_sets is None:
+                aggregate.group = {
+                    f"_g{i}": e for i, e in enumerate(group.expressions if group else [])
+                }
+            else:
+                group_expressions: dict[exp.Expr, str] = {}
+                for grouping_set in grouping_sets:
+                    for e in grouping_set:
+                        if e not in group_expressions:
+                            group_expressions[e] = f"_g{len(group_expressions)}"
+
+                aggregate.group = {name: e for e, name in group_expressions.items()}
+                aggregate.grouping_sets = [
+                    [group_expressions[e] for e in grouping_set] for grouping_set in grouping_sets
+                ]
 
             intermediate: dict[str | exp.Expr, str] = {}
             for k, v in aggregate.group.items():
@@ -421,6 +436,7 @@ class Aggregate(Step):
         self.aggregations: list[exp.Expr] = []
         self.operands: tuple[exp.Expr, ...] = ()
         self.group: dict[str, exp.Expr] = {}
+        self.grouping_sets: list[list[str]] | None = None
         self.source: str | None = None
 
     def _to_s(self, indent: str) -> list[str]:
@@ -433,6 +449,10 @@ class Aggregate(Step):
             lines.append(f"{indent}Group:")
             for expression in self.group.values():
                 lines.append(f"{indent}  - {expression.sql()}")
+        if self.grouping_sets:
+            lines.append(f"{indent}Grouping Sets:")
+            for grouping_set in self.grouping_sets:
+                lines.append(f"{indent}  - {', '.join(grouping_set)}")
         if self.condition:
             lines.append(f"{indent}Having:")
             lines.append(f"{indent}  - {self.condition.sql()}")
@@ -498,3 +518,64 @@ class SetOperation(Step):
     @property
     def type_name(self) -> str:
         return self.op.__name__
+
+
+def _expand_grouping_sets(group: exp.Group) -> list[list[exp.Expr]] | None:
+    """
+    Expand ROLLUP, CUBE and GROUPING SETS in a GROUP BY clause into the explicit list of
+    grouping sets they denote, e.g. ROLLUP(a, b) -> [(a, b), (a), ()]. Returns None for a
+    plain GROUP BY, where every expression belongs to the single implicit grouping set.
+    """
+    if not (
+        group.args.get("rollup")
+        or group.args.get("cube")
+        or group.args.get("grouping_sets")
+        or any(isinstance(e, (exp.Rollup, exp.Cube, exp.GroupingSets)) for e in group.expressions)
+    ):
+        return None
+
+    def rollup_sets(expressions: list[exp.Expr]) -> list[list[exp.Expr]]:
+        return [expressions[:i] for i in range(len(expressions), -1, -1)]
+
+    def cube_sets(expressions: list[exp.Expr]) -> list[list[exp.Expr]]:
+        return [
+            list(subset)
+            for size in range(len(expressions), -1, -1)
+            for subset in itertools.combinations(expressions, size)
+        ]
+
+    def grouping_set_elements(grouping_sets: exp.GroupingSets) -> list[list[exp.Expr]]:
+        elements = []
+        for e in grouping_sets.expressions:
+            if isinstance(e, exp.Rollup):
+                elements.extend(rollup_sets(e.expressions))
+            elif isinstance(e, exp.Cube):
+                elements.extend(cube_sets(e.expressions))
+            elif isinstance(e, exp.GroupingSets):
+                elements.extend(grouping_set_elements(e))
+            elif isinstance(e, exp.Tuple):
+                elements.append(list(e.expressions))
+            else:
+                elements.append([e.unnest()])
+        return elements
+
+    sets: list[list[exp.Expr]] = [[]]
+    for e in group.expressions:
+        if isinstance(e, exp.Rollup):
+            sets = [s + r for s in sets for r in rollup_sets(e.expressions)]
+        elif isinstance(e, exp.Cube):
+            sets = [s + c for s in sets for c in cube_sets(e.expressions)]
+        elif isinstance(e, exp.GroupingSets):
+            sets = [s + g for s in sets for g in grouping_set_elements(e)]
+        else:
+            sets = [s + [e] for s in sets]
+
+    # suffix forms, e.g. MySQL's GROUP BY a, b WITH ROLLUP, apply to all preceding expressions
+    if group.args.get("rollup"):
+        sets = [r for s in sets for r in rollup_sets(s)]
+    if group.args.get("cube"):
+        sets = [c for s in sets for c in cube_sets(s)]
+    for grouping_sets in group.args.get("grouping_sets") or []:
+        sets = [s + g for s in sets for g in grouping_set_elements(grouping_sets)]
+
+    return sets

@@ -420,8 +420,6 @@ class PythonExecutor:
                     table.append(source_nulls + row)
 
     def aggregate(self, step, context):
-        group_by = self.generate_tuple(step.group.values())
-        aggregations = self.generate_tuple(step.aggregations)
         operands = self.generate_tuple(step.operands)
 
         if operands:
@@ -449,16 +447,42 @@ class PythonExecutor:
                 }
             )
 
+        length = len(context.table)
+        table = self.table(list(step.group) + step.aggregations)
+
+        for grouping_set in step.grouping_sets or [tuple(step.group)]:
+            self._aggregate_grouping_set(step, context, table, grouping_set, length)
+
+            if not step.condition and len(table.rows) >= step.offset + step.limit:
+                break
+
+        context = self.context({step.name: table, **{name: table for name in context.tables}})
+
+        if step.projections or step.condition:
+            return self.context(
+                {step.name: self._project_and_filter(context, step, context.table_iter(step.name))}
+            )
+        return context
+
+    def _aggregate_grouping_set(self, step, context, table, grouping_set, length):
+        group_by = self.generate_tuple(step.group[key] for key in grouping_set)
+        aggregations = self.generate_tuple(self._resolve_grouping_funcs(step, grouping_set))
+        positions = {key: i for i, key in enumerate(grouping_set)}
+        full = len(positions) == len(step.group)
+
         context.sort(group_by)
 
         group = None
         start = 0
         end = 1
-        length = len(context.table)
-        table = self.table(list(step.group) + step.aggregations)
 
         def add_row():
-            table.append(group + context.eval_tuple(aggregations))
+            key = (
+                group
+                if full
+                else tuple(group[positions[k]] if k in positions else None for k in step.group)
+            )
+            table.append(key + context.eval_tuple(aggregations))
 
         if length:
             for i in range(length):
@@ -477,16 +501,38 @@ class PythonExecutor:
                     context.set_range(start, end - 1)
                     add_row()
         elif step.limit > 0 and not group_by:
+            # the empty grouping set aggregates the whole (empty) input into one row
             context.set_range(0, 0)
-            table.append(context.eval_tuple(aggregations))
+            group = ()
+            add_row()
 
-        context = self.context({step.name: table, **{name: table for name in context.tables}})
+    @staticmethod
+    def _resolve_grouping_funcs(step, grouping_set):
+        aggregations = step.aggregations
 
-        if step.projections or step.condition:
-            return self.context(
-                {step.name: self._project_and_filter(context, step, context.table_iter(step.name))}
+        if not any(agg.find(exp.Grouping, exp.GroupingId) for agg in aggregations):
+            return aggregations
+
+        members = [step.group[key] for key in grouping_set]
+        operands = {operand.alias: operand.this for operand in step.operands}
+
+        def grouping_value(node):
+            value = 0
+            for arg in node.expressions:
+                arg = operands.get(arg.name, arg) if isinstance(arg, exp.Column) else arg
+                value = (value << 1) | int(not any(arg == member for member in members))
+            return exp.Literal.number(value)
+
+        return [
+            agg.transform(
+                lambda node: (
+                    grouping_value(node)
+                    if isinstance(node, (exp.Grouping, exp.GroupingId))
+                    else node
+                )
             )
-        return context
+            for agg in aggregations
+        ]
 
     def sort(self, step, context):
         projections = self.generate_tuple(step.projections)
