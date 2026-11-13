@@ -1,6 +1,7 @@
 import unittest
 import sys
 
+import sqlglot
 from sqlglot import UnsupportedError, expressions as exp
 from sqlglot.dialects.mysql import MySQL
 from tests.dialects.test_dialect import Validator
@@ -2524,3 +2525,125 @@ COMMENT='客户账户表'"""
             exp.AutoIncrementProperty
         )
         self.assertEqual(prop.this.to_py(), 3000000000)
+
+
+class TestMySQLDump(unittest.TestCase):
+    """Splitting and round-tripping of full mysqldump scripts."""
+
+    def _parse(self, sql):
+        statements = sqlglot.parse(sql, read="mysql")
+        self.assertNotIn(None, statements)
+        self.assertFalse(
+            any(
+                isinstance(statement, (exp.Semicolon, exp.EndStatement)) for statement in statements
+            )
+        )
+        return statements
+
+    def test_dump_fixture_count_and_roundtrip(self):
+        import os
+
+        fixture_path = os.path.join(
+            os.path.dirname(__file__), "..", "fixtures", "mysql", "dump.sql"
+        )
+        with open(fixture_path, encoding="utf-8") as f:
+            dump = f.read()
+
+        statements = self._parse(dump)
+
+        expected_comments = dump.count("/*!")
+        expected_delimiters = dump.count("DELIMITER")
+        self.assertEqual(len(statements), 31)
+        self.assertEqual(
+            sum(isinstance(e, exp.ExecutableComment) for e in statements), expected_comments
+        )
+        self.assertEqual(sum(isinstance(e, exp.Delimiter) for e in statements), expected_delimiters)
+
+        # The final SELECT without a trailing delimiter must not be lost
+        self.assertIsInstance(statements[-1], exp.Select)
+
+        # Executable comments and directives are written back verbatim
+        self.assertEqual(
+            statements[0].sql("mysql"),
+            "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */",
+        )
+        delimiters = [e.sql("mysql") for e in statements if isinstance(e, exp.Delimiter)]
+        self.assertEqual(delimiters, ["DELIMITER ;;", "DELIMITER ;"])
+
+        # The trigger body (inner semicolons and an IF block) survives as one statement
+        trigger = next(
+            e for e in statements if isinstance(e, exp.ExecutableComment) and "TRIGGER" in e.name
+        )
+        self.assertIn("FOR EACH ROW", trigger.name)
+        self.assertIn("END IF;", trigger.name)
+        self.assertTrue(trigger.name.rstrip().endswith("END */"))
+
+    def test_delimiter_directive_keeps_trigger_in_one_statement(self):
+        dump = """DELIMITER ;;
+CREATE TRIGGER trg BEFORE INSERT ON t
+FOR EACH ROW
+BEGIN
+  INSERT INTO log VALUES (NEW.a);
+  UPDATE t SET a = 1;
+END ;;
+DELIMITER ;"""
+        statements = self._parse(dump)
+        self.assertEqual(
+            [type(e) for e in statements],
+            [exp.Delimiter, exp.Command, exp.Delimiter],
+        )
+        trigger = statements[1].sql("mysql")
+        self.assertIn("INSERT INTO log VALUES (NEW.a);", trigger)
+        self.assertIn("UPDATE t SET a = 1;", trigger)
+        self.assertTrue(trigger.rstrip().endswith("END"))
+
+    def test_transaction_begin_is_not_a_block(self):
+        statements = self._parse("BEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT;\nSELECT 2;")
+        self.assertEqual(
+            [type(e) for e in statements],
+            [exp.Transaction, exp.Insert, exp.Commit, exp.Select],
+        )
+
+    def test_executable_comment_is_preserved_and_parsed(self):
+        statements = self._parse("/*!40101 SET NAMES utf8 */;\nSELECT 1;")
+        self.assertEqual(len(statements), 2)
+        comment = statements[0]
+        self.assertIsInstance(comment, exp.ExecutableComment)
+        self.assertEqual(comment.sql("mysql"), "/*!40101 SET NAMES utf8 */")
+        self.assertIsInstance(comment.expression, exp.Set)
+        self.assertIsInstance(statements[1], exp.Select)
+
+    def test_comments_and_empty_statements_do_not_occupy_slots(self):
+        statements = self._parse("-- header\n# hash\n/* block */\nSELECT 1;;;\n-- tail\nSELECT 2;")
+        self.assertEqual([type(e) for e in statements], [exp.Select, exp.Select])
+
+    def test_last_statement_without_delimiter_is_kept(self):
+        statements = self._parse("SELECT 1;\nSELECT 2")
+        self.assertEqual(len(statements), 2)
+        self.assertEqual(statements[1].sql("mysql"), "SELECT 2")
+
+    def test_semicolons_inside_literals_are_ignored(self):
+        statements = self._parse("INSERT INTO t VALUES ('a;b');\nSELECT `c;d` FROM `tbl;name`;")
+        self.assertEqual([type(e) for e in statements], [exp.Insert, exp.Select])
+
+    def test_control_flow_if_vs_ddl_if_exists(self):
+        statements = self._parse(
+            "DROP TABLE IF EXISTS t;\n"
+            "CREATE TABLE t (id INT, PRIMARY KEY (id));\n"
+            "SELECT IF(1 > 0, 'y', 'n') FROM t;"
+        )
+        self.assertEqual([type(e) for e in statements], [exp.Drop, exp.Create, exp.Select])
+
+    def test_nested_stored_program_blocks(self):
+        dump = """CREATE PROCEDURE p()
+BEGIN
+  IF x THEN
+    label1: WHILE y DO
+      SELECT 1;
+    END WHILE label1;
+  END IF;
+END"""
+        statements = self._parse(dump)
+        self.assertEqual(len(statements), 1)
+        self.assertIsInstance(statements[0], exp.Command)
+        self.assertIn("END WHILE label1;", statements[0].sql("mysql"))

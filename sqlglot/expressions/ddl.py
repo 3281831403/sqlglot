@@ -394,6 +394,18 @@ class Command(Expression):
     _hash_raw_args = True
 
 
+class Delimiter(Expression):
+    # The raw client-side directive, e.g. "DELIMITER ;;"
+    arg_types = {"this": True}
+    _hash_raw_args = True
+
+
+class ExecutableComment(Expression):
+    # The raw MySQL version-gated comment, e.g. "/*!40101 SET NAMES utf8 */"
+    arg_types = {"this": True, "expression": False}
+    _hash_raw_args = True
+
+
 class Transaction(Expression):
     arg_types = {"this": False, "modes": False, "mark": False}
 

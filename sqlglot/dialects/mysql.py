@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import typing as t
+
 from sqlglot import exp, tokens
+from sqlglot._typing import ParserArgs
+from sqlglot.dialects._dump import split_mysql_dump, strip_executable_comment
 from sqlglot.dialects.dialect import (
     AliasPrecedence,
     Dialect,
     NormalizationStrategy,
     UsingColumnOrder,
 )
+from sqlglot.errors import ParseError
 from sqlglot.generators.mysql import MySQLGenerator
 from sqlglot.parsers.mysql import MySQLParser
 from sqlglot.tokens import TokenType
@@ -178,3 +183,29 @@ class MySQL(Dialect):
     Parser = MySQLParser
 
     Generator = MySQLGenerator
+
+    def parse(self, sql: str, **opts: t.Unpack[ParserArgs]) -> list[exp.Expr | None]:
+        parser = self.parser(**opts)
+        parser.split_statements = False
+        expressions: list[exp.Expr | None] = []
+
+        for segment in split_mysql_dump(sql):
+            if segment.kind == "delimiter":
+                expressions.append(exp.Delimiter(this=segment.text))
+            elif segment.kind == "comment":
+                inner = strip_executable_comment(segment.text)
+                parsed = None
+                if inner:
+                    # The inner code can be a partial statement (e.g. a "TRIGGER"
+                    # fragment split across version-gated comments); keep the raw
+                    # comment even when it can't be parsed on its own
+                    try:
+                        parsed_expressions = parser.parse(self.tokenize(inner), inner)
+                        parsed = parsed_expressions[0] if parsed_expressions else None
+                    except ParseError:
+                        parsed = None
+                expressions.append(exp.ExecutableComment(this=segment.text, expression=parsed))
+            else:
+                expressions.extend(parser.parse(self.tokenize(segment.text), segment.text))
+
+        return expressions

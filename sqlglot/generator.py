@@ -4425,6 +4425,12 @@ class Generator:
     def command_sql(self, expression: exp.Command) -> str:
         return f"{self.sql(expression, 'this')} {expression.text('expression').strip()}"
 
+    def delimiter_sql(self, expression: exp.Delimiter) -> str:
+        return expression.name
+
+    def executablecomment_sql(self, expression: exp.ExecutableComment) -> str:
+        return expression.name
+
     def comment_sql(self, expression: exp.Comment) -> str:
         this = self.sql(expression, "this")
         kind = expression.args["kind"]

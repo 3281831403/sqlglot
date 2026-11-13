@@ -383,6 +383,7 @@ class Parser:
         "max_errors",
         "max_nodes",
         "dialect",
+        "split_statements",
         "sql",
         "errors",
         "_tokens",
@@ -2030,12 +2031,14 @@ class Parser:
         max_errors: int = 3,
         max_nodes: int = -1,
         dialect: DialectType = None,
+        split_statements: bool = True,
     ):
         self.error_level: ErrorLevel = error_level or ErrorLevel.IMMEDIATE
         self.error_message_context: int = error_message_context
         self.max_errors: int = max_errors
         self.max_nodes: int = max_nodes
         self.dialect: t.Any = _resolve_dialect(dialect)
+        self.split_statements: bool = split_statements
         self.sql: str = ""
         self.errors: list[ParseError] = []
         self._tokens: list[Token] = []
@@ -2323,6 +2326,12 @@ class Parser:
     ) -> list[exp.Expr | None]:
         self.reset()
         self.sql = sql or ""
+
+        if not self.split_statements:
+            self._chunks = [raw_tokens]
+            return self._parse_batch_statements(
+                parse_method=parse_method, sep_first_statement=False
+            )
 
         total = len(raw_tokens)
         chunks: list[list[Token]] = [[]]
