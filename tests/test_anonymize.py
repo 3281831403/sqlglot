@@ -1,6 +1,10 @@
+import json
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
-from sqlglot.anonymize import anonymize, render
+from sqlglot.anonymize import anonymize, anonymize_batch, render
 from sqlglot.tokens import Tokenizer, TokenType
 
 
@@ -520,3 +524,174 @@ ORDER  BY aaaw.aaaaaaaaaaaaac,
             rendered = render(sql, anonymize(sql, dialect), dialect)
             self.assertEqual(rendered, expected)
             self.assertEqual(len(rendered), len(sql))
+
+
+class TestAnonymizeBatch(unittest.TestCase):
+    def _render_batch(self, sqls, dialect=None):
+        return [
+            render(sql, tokens, dialect)
+            for sql, tokens in zip(sqls, anonymize_batch(sqls, dialect))
+        ]
+
+    def test_returns_one_list_per_input(self):
+        sqls = ["SELECT a FROM t", "SELECT b FROM t WHERE x = 1", ""]
+        batches = anonymize_batch(sqls)
+
+        self.assertEqual(len(batches), len(sqls))
+        self.assertEqual([len(batch) for batch in batches], [4, 8, 0])
+
+    def test_identifier_alias_shared_across_statements(self):
+        # the same table appears under different aliases/statements; its anonymized name
+        # must be identical so distribution reports can aggregate by the rewritten name
+        sqls = [
+            "SELECT * FROM orders WHERE id = 1",
+            "SELECT o.id FROM orders o JOIN customers c ON o.id = c.id",
+        ]
+        batches = anonymize_batch(sqls)
+
+        # statement 1 token positions: [SELECT, *, FROM, orders, WHERE, id, =, 1]
+        # statement 2: [SELECT, o, ., id, FROM, orders, o, JOIN, customers, c, ON, ...]
+        orders = batches[0][3].text
+        ident = batches[0][5].text
+        number = batches[0][7].text
+        alias_o = batches[1][1].text
+        customers = batches[1][8].text
+        alias_c = batches[1][9].text
+
+        # orders keeps one alias across both statements, regardless of the local alias
+        self.assertEqual(batches[1][5].text, orders)
+        self.assertEqual(
+            self._render_batch(sqls),
+            [
+                f"SELECT * FROM {orders} WHERE {ident} = {number}",
+                (
+                    f"SELECT {alias_o}.{ident} FROM {orders} {alias_o} JOIN {customers} {alias_c} "
+                    f"ON {alias_o}.{ident} = {alias_c}.{ident}"
+                ),
+            ],
+        )
+
+    def test_quoting_style_does_not_split_alias(self):
+        # bare, double-quoted and backtick-quoted spellings of one identifier share an alias
+        sqls = [
+            "SELECT * FROM orders",
+            'SELECT * FROM "orders"',
+            "SELECT * FROM `orders`",
+        ]
+        rendered = self._render_batch(sqls, "mysql")
+
+        self.assertEqual(rendered[0].split()[-1], rendered[1].split()[-1].strip('"'))
+        self.assertEqual(rendered[0].split()[-1], rendered[2].split()[-1].strip("`"))
+        # the quoting itself survives, only the body is rewritten at the same width
+        self.assertTrue(rendered[1].startswith('SELECT * FROM "'))
+        self.assertTrue(rendered[2].startswith("SELECT * FROM `"))
+        self.assertTrue(all(len(out) == len(sql) for out, sql in zip(rendered, sqls)))
+
+    def test_string_and_number_aliases_shared_across_statements(self):
+        sqls = [
+            "SELECT 'secret', 42 FROM t",
+            "SELECT * FROM u WHERE name = 'secret' AND age > 42",
+        ]
+        batches = anonymize_batch(sqls)
+
+        string_aliases = {
+            t.text for tokens in batches for t in tokens if t.token_type == TokenType.STRING
+        }
+        number_aliases = {
+            t.text for tokens in batches for t in tokens if t.token_type == TokenType.NUMBER
+        }
+        self.assertEqual(len(string_aliases), 1)
+        self.assertEqual(len(number_aliases), 1)
+        # numbers stay distinct from same-spelled strings
+        self.assertNotIn(next(iter(number_aliases)), string_aliases)
+
+    def test_reordering_leaves_each_output_unchanged(self):
+        sqls = [
+            "SELECT a FROM orders",
+            "SELECT b FROM customers WHERE b = 1",
+            "SELECT c FROM orders JOIN customers ON 1 = 1",
+        ]
+
+        forward = self._render_batch(sqls)
+        reordered = self._render_batch(sqls[::-1])
+
+        # every statement renders identically regardless of its position in the batch
+        self.assertEqual(forward, reordered[::-1])
+
+    def test_repeated_runs_are_stable(self):
+        sqls = ["SELECT x FROM orders", "SELECT y FROM orders WHERE y = 7"]
+
+        self.assertEqual(self._render_batch(sqls), self._render_batch(sqls))
+        # every sensitive text resolves to the same token alias on each rerun
+        first = anonymize_batch(sqls)
+        second = anonymize_batch(sqls)
+        self.assertEqual(
+            [[(t.token_type, t.text) for t in tokens] for tokens in first],
+            [[(t.token_type, t.text) for t in tokens] for tokens in second],
+        )
+
+    def test_subprocess_rerun_is_identical(self):
+        # nothing about the alias table may depend on in-process state such as hash seeds
+        sqls = [
+            "SELECT a FROM orders",
+            'SELECT * FROM "orders" JOIN customers ON orders.id = customers.id',
+            "SELECT 123, 'dup' FROM t UNION SELECT 456, 'dup' FROM t",
+        ]
+        expected = self._render_batch(sqls)
+
+        repo_root = Path(__file__).resolve().parents[1]
+        script = (
+            "import json, sys; "
+            f"sys.path.insert(0, {str(repo_root)!r}); "
+            "from sqlglot.anonymize import anonymize_batch, render; "
+            f"sqls = {sqls!r}; "
+            "print(json.dumps([render(sql, tokens) "
+            "for sql, tokens in zip(sqls, anonymize_batch(sqls))]))"
+        )
+        for hash_seed in ("0", "1"):
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", script],
+                capture_output=True,
+                text=True,
+                env={"PYTHONHASHSEED": hash_seed, "PATH": "/usr/bin:/bin"},
+                check=True,
+            )
+            self.assertEqual(json.loads(completed.stdout), expected)
+
+    def test_known_functions_numbers_and_hints_preserved(self):
+        # the batch path reuses the single-statement rewrite rules
+        sqls = [
+            "SELECT /*+ INDEX(secret) */ SUM(x) FROM t WHERE n = 2002",
+            "SELECT my_udf(y), CURRENT_DATE FROM t WHERE n = 2002",
+        ]
+        batches = anonymize_batch(sqls)
+        rendered = [render(sql, tokens) for sql, tokens in zip(sqls, batches)]
+
+        # hint body blanked, markers kept; known keyword function verbatim; unknown udf masked
+        self.assertEqual(rendered[0], "SELECT /*+ ............. */ SUM(d) FROM c WHERE b = 1005")
+        self.assertEqual(
+            rendered[1],
+            "SELECT aaaaaa(e), CURRENT_DATE FROM c WHERE b = 1005",
+        )
+        # the number 2002 shares one shape-preserving alias across both statements
+        number_alias = next(t.text for t in batches[0] if t.token_type == TokenType.NUMBER)
+        self.assertTrue(
+            all(
+                any(t.token_type == TokenType.NUMBER and t.text == number_alias for t in tokens)
+                for tokens in batches
+            )
+        )
+        self.assertTrue(all(len(out) == len(sql) for out, sql in zip(rendered, sqls)))
+
+    def test_tokenize_error_tail_blanked_per_statement(self):
+        sqls = ["SELECT foo, 'unterminated", "SELECT bar FROM t"]
+        batches = anonymize_batch(sqls)
+        rendered = [render(sql, tokens) for sql, tokens in zip(sqls, batches)]
+
+        self.assertEqual(rendered[0], "SELECT aab, 'u...........")
+        self.assertEqual(rendered[1], "SELECT aaa FROM c")
+        self.assertEqual(len(batches), 2)
+        self.assertTrue(all(len(out) == len(sql) for out, sql in zip(rendered, sqls)))
+
+    def test_empty_batch(self):
+        self.assertEqual(anonymize_batch([]), [])

@@ -4,8 +4,8 @@ import string
 
 from sqlglot.dialects.dialect import Dialect, DialectType
 from sqlglot.errors import TokenError
+from sqlglot.parser import Parser
 from sqlglot.tokens import Token, TokenType
-
 
 ALPHABET = string.ascii_lowercase
 ALPHABET_SIZE = len(ALPHABET)
@@ -27,6 +27,73 @@ QUOTED_TYPES = ANONYMIZED_TYPES - {TokenType.NUMBER, TokenType.VAR}
 REWRITTEN_TYPES = {TokenType.HINT, TokenType.UNKNOWN}
 
 
+class _Anonymizer:
+    """Shared state behind `anonymize` and `anonymize_batch`.
+
+    A single instance aliases every token stream it is given, so a token with the same
+    text gets the same alias no matter which statement it appears in. `known` lets a batch
+    pre-assign every alias up front (in a stable order); standalone callers discover keys in
+    encounter order instead.
+    """
+
+    def __init__(
+        self,
+        dialect: Dialect,
+        known: dict[tuple[bool, str], str] | None = None,
+    ) -> None:
+        self.dialect = dialect
+        self.tokenizer_class = dialect.tokenizer_class
+        self.parser_class = dialect.parser_class
+        self.hint_start = self.tokenizer_class.HINT_START
+        self.hint_end = self.tokenizer_class._COMMENTS.get(self.hint_start)
+        self.nested = self.tokenizer_class.NESTED_COMMENTS
+        self.seen: dict[tuple[bool, str], str] = known or {}
+        self.counter = len(self.seen)
+
+    def anonymize(self, tokens: list[Token]) -> list[Token]:
+        for i, token in enumerate(tokens):
+            token.comments = [_blank(comment) for comment in token.comments]
+
+            if token.token_type == TokenType.HINT:
+                # A hint's text is the whole /*+ ... */ comment, so its body is blanked as well
+                text, stop = _blank_comment(
+                    token.text, 0, self.hint_start, self.hint_end, self.nested
+                )
+                token.text = text + _blank(token.text[stop:])
+                continue
+
+            if self._is_known_function(tokens, i):
+                continue
+            if token.token_type not in ANONYMIZED_TYPES or not token.text:
+                continue
+
+            is_number = token.token_type == TokenType.NUMBER
+            key = (is_number, token.text)
+            alias = self.seen.get(key)
+            if alias is None:
+                alias = (
+                    _number_alias(self.counter, token.text)
+                    if is_number
+                    else _alias(self.counter, token.text)
+                )
+                self.seen[key] = alias
+                self.counter += 1
+            token.text = alias
+
+        return tokens
+
+    def _is_known_function(self, tokens: list[Token], i: int) -> bool:
+        token = tokens[i]
+        if token.token_type != TokenType.VAR or i + 1 >= len(tokens):
+            return False
+        if tokens[i + 1].token_type != TokenType.L_PAREN:
+            return False
+        # A function name can live in either registry, e.g. JSON_OBJECT is only in
+        # FUNCTION_PARSERS. They're consulted separately to avoid building their union
+        name = token.text.upper()
+        return name in self.parser_class.FUNCTIONS or name in self.parser_class.FUNCTION_PARSERS
+
+
 def anonymize(
     sql_or_tokens: list[Token] | str,
     dialect: DialectType = None,
@@ -42,10 +109,8 @@ def anonymize(
         dialect: The dialect used to tokenize a SQL string.
     """
     dialect = Dialect.get_or_raise(dialect)
-    tokenizer_class = dialect.tokenizer_class
-    parser_class = dialect.parser_class
-
     errored = False
+
     if isinstance(sql_or_tokens, str):
         sql = sql_or_tokens
         tokenizer = dialect.tokenizer()
@@ -58,22 +123,67 @@ def anonymize(
         tokens = sql_or_tokens
         sql = None
 
-    hint_start = tokenizer_class.HINT_START
-    hint_end = tokenizer_class._COMMENTS.get(hint_start)
-    nested = tokenizer_class.NESTED_COMMENTS
+    _Anonymizer(dialect).anonymize(tokens)
 
-    seen: dict[tuple[bool, str], str] = {}
-    counter = 0
+    if sql is not None:
+        _append_unknown_tail(tokens, sql, errored)
 
+    return tokens
+
+
+def anonymize_batch(
+    sqls: list[str],
+    dialect: DialectType = None,
+) -> list[list[Token]]:
+    """Anonymizes several SQL statements against one shared, order-independent alias table.
+
+    The same identifier, string literal, or number always maps to the same alias across the
+    whole batch, whether it is written bare or quoted, and regardless of statement order:
+    aliases are assigned after every statement is tokenized, with the distinct sensitive
+    texts sorted, so shuffling the inputs (or running the batch in another process) leaves
+    each statement's output unchanged. Returns one token list per input, in the same order
+    and of the same length as `sqls`.
+
+    Args:
+        sqls: The SQL strings to anonymize as one batch.
+        dialect: The dialect used to tokenize the SQL strings.
+    """
+    dialect = Dialect.get_or_raise(dialect)
+
+    tokenized: list[tuple[list[Token], bool]] = []
+    keys: set[tuple[bool, str]] = set()
+    for sql in sqls:
+        tokenizer = dialect.tokenizer()
+        try:
+            tokens = tokenizer.tokenize(sql)
+        except TokenError:
+            tokens = tokenizer.tokens
+            errored = True
+        else:
+            errored = False
+        tokenized.append((tokens, errored))
+        _collect_keys(tokens, dialect.parser_class, keys)
+
+    known = _build_aliases(sorted(keys))
+    anonymizer = _Anonymizer(dialect, known)
+
+    results = []
+    for (tokens, errored), sql in zip(tokenized, sqls):
+        anonymizer.anonymize(tokens)
+        _append_unknown_tail(tokens, sql, errored)
+        results.append(tokens)
+
+    return results
+
+
+def _collect_keys(
+    tokens: list[Token],
+    parser_class: type[Parser],
+    keys: set[tuple[bool, str]],
+) -> None:
     for i, token in enumerate(tokens):
-        token.comments = [_blank(comment) for comment in token.comments]
-
-        if token.token_type == TokenType.HINT:
-            # A hint's text is the whole /*+ ... */ comment, so its body is blanked as well
-            text, stop = _blank_comment(token.text, 0, hint_start, hint_end, nested)
-            token.text = text + _blank(token.text[stop:])
+        if token.token_type not in ANONYMIZED_TYPES or not token.text:
             continue
-
         if (
             token.token_type == TokenType.VAR
             and i + 1 < len(tokens)
@@ -84,40 +194,39 @@ def anonymize(
             name = token.text.upper()
             if name in parser_class.FUNCTIONS or name in parser_class.FUNCTION_PARSERS:
                 continue
-        if token.token_type not in ANONYMIZED_TYPES:
-            continue
-        if not token.text:
-            continue
+        keys.add((token.token_type == TokenType.NUMBER, token.text))
 
-        is_number = token.token_type == TokenType.NUMBER
-        key = (is_number, token.text)
-        alias = seen.get(key)
-        if alias is None:
-            seen[key] = (
-                _number_alias(counter, token.text) if is_number else _alias(counter, token.text)
+
+def _build_aliases(keys: list[tuple[bool, str]]) -> dict[tuple[bool, str], str]:
+    aliases: dict[tuple[bool, str], str] = {}
+    for counter, (is_number, text) in enumerate(keys):
+        aliases[(is_number, text)] = (
+            _number_alias(counter, text) if is_number else _alias(counter, text)
+        )
+    return aliases
+
+
+def _append_unknown_tail(tokens: list[Token], sql: str, errored: bool) -> list[Token]:
+    if not errored:
+        return tokens
+
+    start = tokens[-1].end + 1 if tokens else 0
+    length = len(sql)
+    while start < length and sql[start].isspace():
+        start += 1
+    if start < length:
+        # The first two characters are kept so that the delimiter the tokenizer choked
+        # on is still visible, e.g. 'u, /*, $$, `u
+        tokens.append(
+            Token(
+                TokenType.UNKNOWN,
+                sql[start : start + 2] + "." * (length - start - 2),
+                start=start,
+                end=length - 1,
+                line=sql.count("\n", 0, start) + 1,
+                col=start - sql.rfind("\n", 0, start),
             )
-            counter += 1
-        token.text = seen[key]
-
-    if sql is not None and errored:
-        start = tokens[-1].end + 1 if tokens else 0
-        length = len(sql)
-        while start < length and sql[start].isspace():
-            start += 1
-        if start < length:
-            # The first two characters are kept so that the delimiter the tokenizer choked
-            # on is still visible, e.g. 'u, /*, $$, `u
-            tokens.append(
-                Token(
-                    TokenType.UNKNOWN,
-                    sql[start : start + 2] + "." * (length - start - 2),
-                    start=start,
-                    end=length - 1,
-                    line=sql.count("\n", 0, start) + 1,
-                    col=start - sql.rfind("\n", 0, start),
-                )
-            )
-
+        )
     return tokens
 
 
