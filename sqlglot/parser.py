@@ -3710,7 +3710,7 @@ class Parser:
             comments=comments,
         )
 
-    def _parse_insert(self) -> exp.Insert | exp.MultitableInserts:
+    def _parse_insert(self, replace: bool = False) -> exp.Insert | exp.MultitableInserts:
         comments: list[str] = []
         hint = self._parse_hint()
         overwrite = self._match(TokenType.OVERWRITE)
@@ -3741,7 +3741,12 @@ class Parser:
 
             self._match(TokenType.INTO)
             comments += ensure_list(self._prev_comments)
-            self._match(TokenType.TABLE)
+
+            # The TABLE keyword is only consumed if what follows can't be the table itself,
+            # e.g. INSERT INTO TABLE t vs. a table actually named "table"
+            if self._next and self._next.token_type in self.ID_VAR_TOKENS:
+                self._match(TokenType.TABLE)
+
             is_function = self._match(TokenType.FUNCTION)
 
             this = self._parse_function() if is_function else self._parse_insert_table()
@@ -3812,6 +3817,7 @@ class Parser:
                 returning=returning or self._parse_returning(),
                 overwrite=overwrite,
                 alternative=alternative,
+                replace=replace or None,
                 ignore=ignore,
                 source=self._match(TokenType.TABLE) and self._parse_table(),
             ),

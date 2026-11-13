@@ -154,6 +154,65 @@ class TestMySQL(Validator):
         )
         self.validate_identity("SELECT value FROM value")
 
+    def test_upsert(self):
+        self.validate_identity("REPLACE INTO foo (x, y) VALUES (1, 2)").assert_is(exp.Insert)
+        self.validate_identity("REPLACE INTO dim SELECT id FROM stg WHERE cnt > 100")
+        self.validate_identity(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)"
+        )
+        self.validate_all(
+            "INSERT IGNORE INTO foo (x, y) VALUES (1, 2)",
+            read={
+                "sqlite": "INSERT OR IGNORE INTO foo (x, y) VALUES (1, 2)",
+                "postgres": "INSERT INTO foo (x, y) VALUES (1, 2) ON CONFLICT DO NOTHING",
+            },
+            write={
+                "sqlite": "INSERT OR IGNORE INTO foo (x, y) VALUES (1, 2)",
+                "duckdb": "INSERT OR IGNORE INTO foo (x, y) VALUES (1, 2)",
+                "postgres": "INSERT INTO foo (x, y) VALUES (1, 2) ON CONFLICT DO NOTHING",
+                "spark": UnsupportedError,
+                "bigquery": UnsupportedError,
+            },
+        )
+        self.validate_all(
+            "REPLACE INTO foo (x, y) VALUES (1, 2)",
+            read={
+                "sqlite": "INSERT OR REPLACE INTO foo (x, y) VALUES (1, 2)",
+            },
+            write={
+                "sqlite": "REPLACE INTO foo (x, y) VALUES (1, 2)",
+                "duckdb": "INSERT OR REPLACE INTO foo (x, y) VALUES (1, 2)",
+                "postgres": UnsupportedError,
+                "spark": UnsupportedError,
+            },
+        )
+        self.validate_all(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+            read={
+                "postgres": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+            },
+            write={
+                "postgres": UnsupportedError,
+                "duckdb": UnsupportedError,
+                "sqlite": UnsupportedError,
+                "spark": UnsupportedError,
+            },
+        )
+        # MySQL applies the update to any conflicting unique key, so the conflict
+        # target is dropped and EXCLUDED references become VALUES() calls
+        self.validate_all(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b) + 1",
+            read={
+                "postgres": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a, b) DO UPDATE SET b = EXCLUDED.b + 1",
+            },
+        )
+        self.validate_all(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+            read={
+                "postgres": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b WHERE t.a > 1",
+            },
+        )
+
     def test_ddl(self):
         self.validate_identity("DROP TEMPORARY TABLE IF EXISTS db.t1, t2 CASCADE")
 
@@ -809,7 +868,8 @@ class TestMySQL(Validator):
             "SELECT * FROM t1, t2, t3 FOR SHARE OF t1 NOWAIT FOR UPDATE OF t2, t3 SKIP LOCKED"
         )
         self.validate_identity(
-            "REPLACE INTO table SELECT id FROM table2 WHERE cnt > 100", check_command_warning=True
+            "REPLACE INTO table SELECT id FROM table2 WHERE cnt > 100",
+            "REPLACE INTO `table` SELECT id FROM table2 WHERE cnt > 100",
         )
         self.validate_identity(
             "CAST(x AS VARCHAR)",

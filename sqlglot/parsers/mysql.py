@@ -191,6 +191,7 @@ class MySQLParser(parser.Parser):
 
     STATEMENT_PARSERS = {
         **parser.Parser.STATEMENT_PARSERS,
+        TokenType.REPLACE: lambda self: self._parse_insert(replace=True),
         TokenType.SHOW: lambda self: self._parse_show(),
     }
 

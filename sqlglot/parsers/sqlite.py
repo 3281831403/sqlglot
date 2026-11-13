@@ -125,6 +125,7 @@ class SQLiteParser(parser.Parser):
         TokenType.ATTACH: lambda self: self._parse_attach_detach(),
         TokenType.DETACH: lambda self: self._parse_attach_detach(is_attach=False),
         TokenType.PRAGMA: lambda self: self._parse_pragma(),
+        TokenType.REPLACE: lambda self: self._parse_insert(replace=True),
     }
 
     RANGE_PARSERS = {

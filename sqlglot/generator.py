@@ -399,6 +399,21 @@ class Generator:
     # Whether to include the "SET" keyword in the "INSERT ... ON DUPLICATE KEY UPDATE" statement
     DUPLICATE_KEY_UPDATE_WITH_SET = True
 
+    # Whether the "INSERT OR <alternative>" upsert syntax (e.g. INSERT OR IGNORE) is supported
+    INSERT_OR_ALTERNATIVE_SUPPORTED = True
+
+    # Whether the "INSERT IGNORE" syntax is supported
+    INSERT_IGNORE_SUPPORTED = True
+
+    # Whether the "REPLACE INTO" upsert variant of INSERT is supported
+    REPLACE_INTO_SUPPORTED = True
+
+    # Whether the "ON CONFLICT" upsert clause is supported
+    ON_CONFLICT_SUPPORTED = True
+
+    # Whether MySQL's "ON DUPLICATE KEY UPDATE" upsert clause is supported
+    ON_DUPLICATE_KEY_UPDATE_SUPPORTED = True
+
     # Whether to generate the limit as TOP <value> instead of LIMIT <value>
     LIMIT_IS_TOP = False
 
@@ -2455,9 +2470,24 @@ class Generator:
 
         stored = self.sql(expression, "stored")
         stored = f" {stored}" if stored else ""
+
         alternative = expression.args.get("alternative")
+        if alternative and not self.INSERT_OR_ALTERNATIVE_SUPPORTED:
+            self.unsupported(f"INSERT OR {alternative} is not supported")
+            alternative = None
         alternative = f" OR {alternative}" if alternative else ""
-        ignore = " IGNORE" if expression.args.get("ignore") else ""
+
+        ignore = expression.args.get("ignore")
+        if ignore and not self.INSERT_IGNORE_SUPPORTED:
+            self.unsupported("INSERT IGNORE is not supported")
+            ignore = None
+        ignore = " IGNORE" if ignore else ""
+
+        replace = expression.args.get("replace")
+        if replace and not self.REPLACE_INTO_SUPPORTED:
+            self.unsupported("REPLACE INTO is not supported")
+            replace = None
+
         is_function = expression.args.get("is_function")
         if is_function:
             this = f"{this} FUNCTION"
@@ -2488,7 +2518,7 @@ class Generator:
         source = self.sql(expression, "source")
         source = f"TABLE {source}" if source else ""
 
-        sql = f"INSERT{hint}{alternative}{ignore}{this}{stored}{by_name}{exists}{partition_by}{settings}{where}{using}{expression_sql}{source}"
+        sql = f"{'REPLACE' if replace else 'INSERT'}{hint}{alternative}{ignore}{this}{stored}{by_name}{exists}{partition_by}{settings}{where}{using}{expression_sql}{source}"
         return self.prepend_ctes(expression, sql)
 
     def introducer_sql(self, expression: exp.Introducer) -> str:
@@ -2508,7 +2538,15 @@ class Generator:
         return expression.name
 
     def onconflict_sql(self, expression: exp.OnConflict) -> str:
-        conflict = "ON DUPLICATE KEY" if expression.args.get("duplicate") else "ON CONFLICT"
+        duplicate = expression.args.get("duplicate")
+        if duplicate and not self.ON_DUPLICATE_KEY_UPDATE_SUPPORTED:
+            self.unsupported("ON DUPLICATE KEY UPDATE is not supported")
+            return ""
+        if not duplicate and not self.ON_CONFLICT_SUPPORTED:
+            self.unsupported("ON CONFLICT is not supported")
+            return ""
+
+        conflict = "ON DUPLICATE KEY" if duplicate else "ON CONFLICT"
 
         constraint = self.sql(expression, "constraint")
         constraint = f" ON CONSTRAINT {constraint}" if constraint else ""

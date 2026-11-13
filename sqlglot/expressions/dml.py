@@ -204,6 +204,7 @@ class Insert(Expression, DDL, DML):
         "overwrite": False,
         "exists": False,
         "alternative": False,
+        "replace": False,
         "where": False,
         "ignore": False,
         "by_name": False,

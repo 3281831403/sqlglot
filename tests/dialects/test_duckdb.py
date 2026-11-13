@@ -940,6 +940,32 @@ class TestDuckDB(Validator):
             "ARG_MAX(keyword_name, keyword_category, 3 ORDER BY keyword_name DESC)"
         )
         self.validate_identity("INSERT INTO t DEFAULT VALUES RETURNING (c1)")
+        self.validate_all(
+            "INSERT OR REPLACE INTO foo (x, y) VALUES (1, 2)",
+            read={
+                "mysql": "REPLACE INTO foo (x, y) VALUES (1, 2)",
+                "sqlite": "INSERT OR REPLACE INTO foo (x, y) VALUES (1, 2)",
+            },
+        )
+        self.validate_all(
+            "INSERT OR IGNORE INTO foo (x, y) VALUES (1, 2)",
+            read={
+                "mysql": "INSERT IGNORE INTO foo (x, y) VALUES (1, 2)",
+                "sqlite": "INSERT OR IGNORE INTO foo (x, y) VALUES (1, 2)",
+            },
+        )
+        self.validate_all(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT(a) DO UPDATE SET b = EXCLUDED.b",
+            read={
+                "postgres": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+            },
+        )
+        # MySQL's ON DUPLICATE KEY UPDATE has no conflict target to map onto
+        with self.assertRaises(UnsupportedError):
+            parse_one(
+                "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+                read="mysql",
+            ).sql("duckdb", unsupported_level=ErrorLevel.RAISE)
         self.validate_identity("CREATE TABLE notes (watermark TEXT)")
         self.validate_identity("SELECT LIST_TRANSFORM([5, NULL, 6], LAMBDA x : COALESCE(x, 0) + 1)")
         self.validate_identity("SELECT LIST_TRANSFORM(nbr, LAMBDA x : x + 1) FROM article AS a")

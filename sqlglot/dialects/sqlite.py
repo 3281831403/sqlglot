@@ -51,7 +51,7 @@ class SQLite(Dialect):
 
         KEYWORDS.pop("/*+")
 
-        COMMANDS = {*tokens.Tokenizer.COMMANDS, TokenType.REPLACE}
+        COMMANDS = tokens.Tokenizer.COMMANDS
 
     Parser = SQLiteParser
 

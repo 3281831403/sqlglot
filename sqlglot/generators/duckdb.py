@@ -1635,6 +1635,7 @@ class DuckDBGenerator(generator.Generator):
     SUPPORTS_LIKE_QUANTIFIERS = False
     HISTORICAL_DATA_POST_ALIAS = True
     SET_ASSIGNMENT_REQUIRES_VARIABLE_KEYWORD = True
+    ON_DUPLICATE_KEY_UPDATE_SUPPORTED = False
 
     TRANSFORMS = {
         **generator.Generator.TRANSFORMS,
@@ -3990,6 +3991,29 @@ class DuckDBGenerator(generator.Generator):
         _prepare_binary_bitwise_args(expression)
         result_sql = self.binary(expression, op)
         return _gen_with_cast_to_blob(self, expression, result_sql)
+
+    def insert_sql(self, expression: exp.Insert) -> str:
+        # DuckDB supports the SQLite-style INSERT OR <action> upsert syntax
+        if expression.args.get("replace") or expression.args.get("ignore"):
+            expression = expression.copy()
+            if expression.args.get("replace"):
+                expression.set("replace", None)
+                expression.set("alternative", "REPLACE")
+            if expression.args.get("ignore"):
+                expression.set("ignore", None)
+                expression.set("alternative", "IGNORE")
+
+        return super().insert_sql(expression)
+
+    def onconflict_sql(self, expression: exp.OnConflict) -> str:
+        # DuckDB's conflict target only supports plain column references
+        expression = expression.copy()
+        for key in expression.args.get("conflict_keys") or []:
+            if isinstance(key, exp.Ordered):
+                key.set("desc", None)
+                key.set("nulls_first", False)
+
+        return super().onconflict_sql(expression)
 
     def bitwisexor_sql(self, expression: exp.BitwiseXor) -> str:
         _prepare_binary_bitwise_args(expression)

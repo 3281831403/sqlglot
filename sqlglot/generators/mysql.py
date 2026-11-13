@@ -109,6 +109,13 @@ def _ts_or_ds_to_date_sql(self: MySQLGenerator, expression: exp.TsOrDsToDate) ->
     return _str_to_date_sql(self, expression) if time_format else self.func("DATE", expression.this)
 
 
+def _excluded_to_values(expression: exp.Expr) -> exp.Expr:
+    # Postgres-style EXCLUDED.col references correspond to VALUES(col) in MySQL
+    if isinstance(expression, exp.Column) and expression.table.upper() == "EXCLUDED":
+        return exp.func("VALUES", expression.this)
+    return expression
+
+
 class MySQLGenerator(generator.Generator):
     BYTE_STRING_FUNCTION = "UNHEX"
     SELECT_KINDS = ()
@@ -128,6 +135,8 @@ class MySQLGenerator(generator.Generator):
     JOIN_HINTS = False
     TABLE_HINTS = True
     DUPLICATE_KEY_UPDATE_WITH_SET = False
+    ON_CONFLICT_SUPPORTED = False
+    INSERT_OR_ALTERNATIVE_SUPPORTED = False
     QUERY_HINT_SEP = " "
     VALUES_AS_TABLE = False
     NVL2_SUPPORTED = False
@@ -652,6 +661,50 @@ class MySQLGenerator(generator.Generator):
                     break
 
         return locations
+
+    def insert_sql(self, expression: exp.Insert) -> str:
+        alternative = expression.args.get("alternative")
+        conflict = expression.args.get("conflict")
+
+        if alternative or (conflict and not conflict.args.get("duplicate")):
+            expression = expression.copy()
+
+            if alternative:
+                expression.set("alternative", None)
+                if alternative.upper() == "IGNORE":
+                    expression.set("ignore", True)
+                elif alternative.upper() == "REPLACE":
+                    expression.set("replace", True)
+                else:
+                    self.unsupported(f"INSERT OR {alternative} is not supported in MySQL")
+
+            if conflict and not conflict.args.get("duplicate"):
+                action = conflict.text("action").upper()
+                if action == "DO NOTHING":
+                    expression.set("conflict", None)
+                    expression.set("ignore", True)
+                elif action == "DO UPDATE":
+                    expression.set("conflict", self._on_conflict_to_duplicate_key(conflict))
+
+        return super().insert_sql(expression)
+
+    def _on_conflict_to_duplicate_key(self, conflict: exp.OnConflict) -> exp.OnConflict:
+        # MySQL's ON DUPLICATE KEY UPDATE applies to any unique key, so the conflict
+        # target is dropped; the clauses MySQL can't express are flagged as unsupported
+        if conflict.args.get("constraint"):
+            self.unsupported("ON CONFLICT ON CONSTRAINT is not supported in MySQL")
+        if conflict.args.get("index_predicate"):
+            self.unsupported("ON CONFLICT index predicates are not supported in MySQL")
+        if conflict.args.get("where"):
+            self.unsupported("ON CONFLICT ... DO UPDATE ... WHERE is not supported in MySQL")
+
+        return exp.OnConflict(
+            duplicate=True,
+            action=exp.var("UPDATE"),
+            expressions=[
+                assignment.transform(_excluded_to_values) for assignment in conflict.expressions
+            ],
+        )
 
     def computedcolumnconstraint_sql(self, expression: exp.ComputedColumnConstraint) -> str:
         persisted = "STORED" if expression.args.get("persisted") else "VIRTUAL"

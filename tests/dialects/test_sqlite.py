@@ -631,7 +631,7 @@ class TestSQLite(Validator):
             'CREATE TABLE "foo t" ("foo t id" TEXT NOT NULL, PRIMARY KEY ("foo t id"))',
             'CREATE TABLE "foo t" ("foo t id" TEXT NOT NULL PRIMARY KEY)',
         )
-        self.validate_identity("REPLACE INTO foo (x, y) VALUES (1, 2)", check_command_warning=True)
+        self.validate_identity("REPLACE INTO foo (x, y) VALUES (1, 2)")
         self.validate_identity(
             "ATTACH DATABASE 'foo' AS schema_name", "ATTACH 'foo' AS schema_name"
         )
@@ -950,6 +950,51 @@ class TestSQLite(Validator):
         self.validate_identity(
             "INSERT INTO tbl (x, y) VALUES (1, 'a') ON CONFLICT(x) WHERE x > 0 DO UPDATE SET y = excluded.y"
         )
+        self.validate_all(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT(a) DO UPDATE SET b = EXCLUDED.b",
+            read={
+                "postgres": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+            },
+            write={
+                "mysql": "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+                "duckdb": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT(a) DO UPDATE SET b = EXCLUDED.b",
+            },
+        )
+        self.validate_all(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT DO NOTHING",
+            read={
+                "postgres": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT DO NOTHING",
+            },
+            write={
+                "mysql": "INSERT IGNORE INTO t (a, b) VALUES (1, 2)",
+                "duckdb": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT DO NOTHING",
+            },
+        )
+        self.validate_all(
+            "REPLACE INTO foo (x, y) VALUES (1, 2)",
+            read={
+                "mysql": "REPLACE INTO foo (x, y) VALUES (1, 2)",
+            },
+            write={
+                "mysql": "REPLACE INTO foo (x, y) VALUES (1, 2)",
+                "duckdb": "INSERT OR REPLACE INTO foo (x, y) VALUES (1, 2)",
+                "postgres": UnsupportedError,
+            },
+        )
+        self.validate_all(
+            "INSERT OR IGNORE INTO foo (x, y) VALUES (1, 2)",
+            write={
+                "mysql": "INSERT IGNORE INTO foo (x, y) VALUES (1, 2)",
+                "postgres": "INSERT INTO foo (x, y) VALUES (1, 2) ON CONFLICT DO NOTHING",
+                "spark": UnsupportedError,
+            },
+        )
+        # MySQL's ON DUPLICATE KEY UPDATE has no conflict target to map onto
+        with self.assertRaises(UnsupportedError):
+            parse_one(
+                "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+                read="mysql",
+            ).sql("sqlite", unsupported_level=ErrorLevel.RAISE)
         self.validate_identity("CREATE TABLE foo (id INTEGER PRIMARY KEY ASC)")
         self.validate_identity("CREATE TEMPORARY TABLE foo (id INTEGER)")
         self.validate_identity("CREATE VIRTUAL TABLE docs USING fts5(title, content)")

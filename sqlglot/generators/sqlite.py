@@ -103,6 +103,7 @@ class SQLiteGenerator(generator.Generator):
     SUPPORTS_MEDIAN = False
     JSON_KEY_VALUE_PAIR_SEP = ","
     PARSE_JSON_NAME: str | None = None
+    ON_DUPLICATE_KEY_UPDATE_SUPPORTED = False
 
     SUPPORTED_JSON_PATH_PARTS = {
         exp.JSONPathKey,
@@ -240,6 +241,15 @@ class SQLiteGenerator(generator.Generator):
             expression.set("alternative", "IGNORE")
 
         return super().insert_sql(expression)
+
+    def onconflict_sql(self, expression: exp.OnConflict) -> str:
+        # SQLite doesn't support NULLS FIRST/LAST in the upsert conflict target
+        expression = expression.copy()
+        for key in expression.args.get("conflict_keys") or []:
+            if isinstance(key, exp.Ordered):
+                key.set("nulls_first", not key.args.get("desc"))
+
+        return super().onconflict_sql(expression)
 
     def bitwiseandagg_sql(self, expression: exp.BitwiseAndAgg) -> str:
         self.unsupported("BITWISE_AND aggregation is not supported in SQLite")

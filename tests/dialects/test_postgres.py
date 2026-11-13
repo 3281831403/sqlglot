@@ -1711,6 +1711,32 @@ FROM json_data, field_ids""",
         self.validate_identity(
             "INSERT INTO tbl (a, b) VALUES (1, 'x') ON CONFLICT(a, LOWER(b)) DO UPDATE SET b = excluded.b"
         )
+        self.validate_all(
+            "INSERT INTO foo (x, y) VALUES (1, 2) ON CONFLICT DO NOTHING",
+            read={
+                "mysql": "INSERT IGNORE INTO foo (x, y) VALUES (1, 2)",
+                "sqlite": "INSERT OR IGNORE INTO foo (x, y) VALUES (1, 2)",
+            },
+        )
+        self.validate_all(
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT(a) DO UPDATE SET b = EXCLUDED.b",
+            write={
+                "mysql": "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+                "sqlite": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT(a) DO UPDATE SET b = EXCLUDED.b",
+                "duckdb": "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT(a) DO UPDATE SET b = EXCLUDED.b",
+                "spark": UnsupportedError,
+                "hive": UnsupportedError,
+                "trino": UnsupportedError,
+                "bigquery": UnsupportedError,
+            },
+        )
+        # MySQL's upsert variants can't be expressed without knowing the conflict target
+        for sql in (
+            "REPLACE INTO foo (x, y) VALUES (1, 2)",
+            "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b)",
+        ):
+            with self.assertRaises(UnsupportedError):
+                parse_one(sql, read="mysql").sql("postgres", unsupported_level=ErrorLevel.RAISE)
         self.validate_identity(
             "ALTER TABLE tested_table ADD CONSTRAINT unique_example UNIQUE (column_name) NOT VALID"
         )

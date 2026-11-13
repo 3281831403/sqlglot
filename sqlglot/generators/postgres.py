@@ -298,6 +298,8 @@ class PostgresGenerator(generator.Generator):
     CAN_IMPLEMENT_ARRAY_ANY = True
     SUPPORTS_WINDOW_EXCLUDE = True
     COPY_HAS_INTO_KEYWORD = False
+    REPLACE_INTO_SUPPORTED = False
+    ON_DUPLICATE_KEY_UPDATE_SUPPORTED = False
     ARRAY_CONCAT_IS_VAR_LEN = False
     SUPPORTS_MEDIAN = False
     ARRAY_SIZE_DIM_REQUIRED: bool | None = True
@@ -611,6 +613,25 @@ class PostgresGenerator(generator.Generator):
 
     def isascii_sql(self, expression: exp.IsAscii) -> str:
         return f"({self.sql(expression.this)} ~ '^[[:ascii:]]*$')"
+
+    def insert_sql(self, expression: exp.Insert) -> str:
+        alternative = expression.args.get("alternative")
+
+        if alternative or expression.args.get("ignore"):
+            expression = expression.copy()
+            alternative = (alternative or "").upper()
+
+            if alternative == "IGNORE" or expression.args.get("ignore"):
+                # INSERT [OR] IGNORE corresponds to ON CONFLICT DO NOTHING in Postgres
+                expression.set("alternative", None)
+                expression.set("ignore", None)
+                if not expression.args.get("conflict"):
+                    expression.set("conflict", exp.OnConflict(action=exp.var("DO NOTHING")))
+            elif alternative:
+                self.unsupported(f"INSERT OR {alternative} is not supported in Postgres")
+                expression.set("alternative", None)
+
+        return super().insert_sql(expression)
 
     def ignorenulls_sql(self, expression: exp.IgnoreNulls) -> str:
         # https://www.postgresql.org/docs/current/functions-window.html
